@@ -4,7 +4,7 @@ END;
 GO
 -- Rebuild heaps that have had user scans in the last @ScannedWithinLastNumberOfDays days 
 -- and have non-zero forwarded fetch counts.
-ALTER PROCEDURE dbo.sp_rebuild_heaps (
+ALTER PROCEDURE [dbo].[sp_rebuild_heaps] (
 	@Execute BIT = 1
 	,@Database sysname = N'all'
 	,@ScannedWithinLastNumberOfDays SMALLINT = 7
@@ -16,10 +16,6 @@ BEGIN
 SET NOCOUNT, XACT_ABORT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET ANSI_WARNINGS OFF;
-
-SELECT @Execute = 1 -- This tells to to actually execute the rebuild SQL rather than just print it.
-	--@Database = 'Vision'
-	--,@StopBy = ''
 
 -- Internal variables
 DECLARE @DBID INT
@@ -38,31 +34,59 @@ DECLARE @DBID INT
 DECLARE @DB TABLE (DBID INT IDENTITY NOT NULL PRIMARY KEY, database_id INT NOT NULL, DBName sysname NOT NULL, MaxLastUserScanOnHeap DATETIME2 NULL)
 CREATE TABLE #Table (TableID INT IDENTITY NOT NULL PRIMARY KEY, SchemaName sysname NOT NULL, TableName sysname NOT NULL, ForwardedFetchCount BIGINT NOT NULL)
 
+-- Log a header
 PRINT '-- **************************************************************************************************'
 PRINT '-- **************************************************************************************************'
 PRINT '-- Rebuild Active Heaps - starting at: ' + CONVERT(VARCHAR(50), SYSDATETIME())
 
--- Find the DBs that have heap scans in the last 7 days, order by most recently scanned DBs
-INSERT INTO @DB (database_id, DBName, MaxLastUserScanOnHeap)
-SELECT
-	ddius.database_id
-	,DB_NAME(ddius.database_id) AS DBName
-	,MAX(ddius.last_user_scan) AS MaxLastUserScanOnHeap
-FROM
-	sys.dm_db_index_usage_stats AS ddius
-WHERE
-	ddius.database_id > 4
-	AND ddius.index_id = 0 -- Heap
-GROUP BY
-	ddius.database_id
-	,DB_NAME(ddius.database_id)
-HAVING
-	MAX(ddius.last_user_scan) > DATEADD(DAY, -7, SYSDATETIME())
-ORDER BY
-	MAX(ddius.last_user_scan) DESC
+-- Process input DB?  Or all DBs?
+IF @Database = 'all' BEGIN 
+	-- Find the DBs that have heap scans in the last 7 days, order by most recently scanned DBs
+	INSERT INTO @DB (database_id, DBName, MaxLastUserScanOnHeap)
+	SELECT
+		ddius.database_id
+		,DB_NAME(ddius.database_id) AS DBName
+		,MAX(ddius.last_user_scan) AS MaxLastUserScanOnHeap
+	FROM
+		sys.dm_db_index_usage_stats AS ddius
+	WHERE
+		ddius.database_id > 4
+		AND ddius.index_id = 0 -- Heap
+	GROUP BY
+		ddius.database_id
+		,DB_NAME(ddius.database_id)
+	HAVING
+		MAX(ddius.last_user_scan) > DATEADD(DAY, -7, SYSDATETIME())
+	ORDER BY
+		MAX(ddius.last_user_scan) DESC
+END ELSE BEGIN
+	INSERT INTO @DB (database_id, DBName, MaxLastUserScanOnHeap)
+	SELECT
+		ddius.database_id
+		,DB_NAME(ddius.database_id) AS DBName
+		,MAX(ddius.last_user_scan) AS MaxLastUserScanOnHeap
+	FROM
+		sys.dm_db_index_usage_stats AS ddius
+	WHERE
+		ddius.database_id  = DB_ID(@Database)
+		AND ddius.index_id = 0 -- Heap
+	GROUP BY
+		ddius.database_id
+		,DB_NAME(ddius.database_id)
+	HAVING
+		MAX(ddius.last_user_scan) > DATEADD(DAY, -7, SYSDATETIME())
+	ORDER BY
+		MAX(ddius.last_user_scan) DESC
+END
 
-SELECT @DBID = 1, @MaxDBID = MAX(d.DBID) FROM @DB AS d
+SELECT @DBID = 1, @MaxDBID = COALESCE(MAX(d.DBID), 0) FROM @DB AS d;
 
+IF @MaxDBID = 0 BEGIN
+	PRINT 'No databases meet the criteria.  Exiting.';
+	RETURN 0;
+END;
+
+-- We have some DBs that meet our criteria - let's loop through them.
 WHILE @DBID <= @MaxDBID BEGIN
 	SELECT
 		@database_id = d.database_id
@@ -72,7 +96,7 @@ WHILE @DBID <= @MaxDBID BEGIN
 	WHERE
 		d.DBID = @DBID
 
-	PRINT '-- Rebuilding active heaps on ' + @DBName + ' ***********************************************************************'
+	PRINT '-- Rebuilding active heaps on ' + @DBName + REPLICATE('*', (50 - LEN(@DBName)))
 
 	-- First, clean out our table list to start fresh.
 	TRUNCATE TABLE #Table;
@@ -124,7 +148,7 @@ WHILE @DBID <= @MaxDBID BEGIN
 
 		-- Build and execute the SQL to rebuild the heap (and all NCs)
 		SET @FullyQualifiedObjectName = '[' + @DBName + '].[' + @SchemaName + '].[' + @TableName + ']'
-		PRINT '-- Rebuilding ' + @FullyQualifiedObjectName + ' : ForwardFetchCount = ' + CONVERT(VARCHAR(50), @ForwardedFetchCount)
+		PRINT '-- Rebuilding ' + @FullyQualifiedObjectName + ', ForwardFetchCount = ' + CONVERT(VARCHAR(50), @ForwardedFetchCount)
 		SET @SQL = 'ALTER TABLE ' + @FullyQualifiedObjectName + ' REBUILD;'
 		IF @Execute = 1 BEGIN
 			EXEC(@SQL)
